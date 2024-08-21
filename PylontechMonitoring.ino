@@ -466,7 +466,7 @@ void wakeUpConsole()
 }
 
 #define MAX_PYLON_BATTERIES 8
-#define MAX_PYLON_CELLS 1
+#define MAX_PYLON_CELLS 15
 
 struct pylonBattery
 {

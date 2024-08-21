@@ -1,17 +1,19 @@
-#include <ESP8266WiFi.h>
-#include <ESP8266mDNS.h>
+#include <WiFi.h>
+#include <ESPmDNS.h>
 #include <ArduinoOTA.h>
-#include <ESP8266WebServer.h>
-#include <circular_log.h>
+#include <WebServer.h>
 #include <ArduinoJson.h>
-#include <NTPClient.h>
-#include <ESP8266TimerInterrupt.h>
+#include <SimpleTimer.h>
+#include <TimeLib.h> //https://github.com/PaulStoffregen/Time
+#include <ntp_time.h>
+#include <circular_log.h>
+//#include <ESP32_New_TimerInterrupt.h>
 
 //+++ START CONFIGURATION +++
 
 //IMPORTANT: Specify your WIFI settings:
-#define WIFI_SSID "*** your ssid ***"
-#define WIFI_PASS "*** your wifi pass ***"
+#define WIFI_SSID "ssid"
+#define WIFI_PASS "password"
 #define WIFI_HOSTNAME "PylontechBattery"
 
 //Uncomment for static ip configuration
@@ -46,12 +48,12 @@ const char* www_password = "password";
 
 //NOTE 1: if you want to change what is pushed via MQTT - edit function: pushBatteryDataToMqtt.
 //NOTE 2: MQTT_TOPIC_ROOT is where battery will push MQTT topics. For example "soc" will be pushed to: "home/grid_battery/soc"
-#define MQTT_SERVER        "*** your MQTT server ***"
+#define MQTT_SERVER        "192.168.0.1"
 #define MQTT_PORT          1883
-#define MQTT_USER          "*** your MQTT username ***"
-#define MQTT_PASSWORD      "*** your MQTT password ***"
-#define MQTT_TOPIC_ROOT    "pylontech/sensor/grid_battery/"  //this is where mqtt data will be pushed
-#define MQTT_PUSH_FREQ_SEC 2  //maximum mqtt update frequency in seconds
+#define MQTT_USER          "username"
+#define MQTT_PASSWORD      "password"
+#define MQTT_TOPIC_ROOT    "pylontech/garage_battery/"  //this is where mqtt data will be pushed
+#define MQTT_PUSH_FREQ_SEC 1  //maximum mqtt update frequency in seconds
 
 //+++   END CONFIGURATION +++
 
@@ -64,14 +66,15 @@ PubSubClient mqttClient(espClient);
 //text response
 char g_szRecvBuff[7000];
 
-const long utcOffsetInSeconds = GMT;
-char daysOfTheWeek[7][12] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
+//const long utcOffsetInSeconds = GMT;
+//char daysOfTheWeek[7][12] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
 // Define NTP Client to get time
-WiFiUDP ntpUDP;
-NTPClient timeClient(ntpUDP, "pool.ntp.org", utcOffsetInSeconds);
+//WiFiUDP ntpUDP;
+//NTPClient timeClient(ntpUDP, "pool.ntp.org", utcOffsetInSeconds);
 
 
-ESP8266WebServer server(80);
+WebServer server(80);
+SimpleTimer timer;
 circular_log<7000> g_log;
 bool ntpTimeReceived = false;
 int g_baudRate = 0;
@@ -82,10 +85,10 @@ void Log(const char* msg)
 }
 
 //Define Interrupt Timer to Calculate Power meter every second (kWh)
-#define USING_TIM_DIV1 true                                             // for shortest and most accurate timer
-ESP8266Timer ITimer;
-bool setInterval(unsigned long interval, timer_callback callback);      // interval (in microseconds)
-#define TIMER_INTERVAL_MS 1000
+//#define USING_TIM_DIV1 true                                             // for shortest and most accurate timer
+//ESP32Timer ITimer;
+//bool setInterval(unsigned long interval, timer_callback callback);      // interval (in microseconds)
+//#define TIMER_INTERVAL_MS 1000
 
 //Global Variables for the Power Meter - accessible from the calculating interrupt und from main
 unsigned long powerIN = 0;       //WS gone in to the BAttery
@@ -125,10 +128,21 @@ void setup() {
 
   ArduinoOTA.setHostname(WIFI_HOSTNAME);
   ArduinoOTA.begin();
+
+  // Initialize mDNS
+  if (!MDNS.begin("esp32-pylontech")) {   // Set the hostname to "esp32.local"
+    Serial.println("Error setting up MDNS responder!");
+    while(1) {
+      delay(1000);
+    }
+  }
+  Serial.println("mDNS responder started");
+
   server.on("/", handleRoot);
   server.on("/log", handleLog);
   server.on("/req", handleReq);
   server.on("/jsonOut", handleJsonOut);
+  server.on("/jsonBatOut", handleJsonBatOut);  
   server.on("/reboot", [](){
     #ifdef AUTHENTICATION
     if (!server.authenticate(www_username, www_password)) {
@@ -140,7 +154,8 @@ void setup() {
   
   server.begin(); 
   
-  timeClient.begin();
+  //timeClient.begin();
+  syncTime();
 
   
 #ifdef ENABLE_MQTT
@@ -307,8 +322,6 @@ void handleReq()
   handleRoot();
 }
 
-
-
 void handleJsonOut()
 {
   #ifdef AUTHENTICATION
@@ -327,13 +340,31 @@ void handleJsonOut()
   server.send(200, "application/json", g_szRecvBuff);
 }
 
+void handleJsonBatOut()
+{
+  #ifdef AUTHENTICATION
+  if (!server.authenticate(www_username, www_password)) {
+    return server.requestAuthentication();
+  }
+  #endif
+  if(sendCommandAndReadSerialResponse("bat") == false)
+  {
+    server.send(500, "text/plain", "Failed to get response to 'bat' command");
+    return;
+  }
+
+  parseBatResponse(g_szRecvBuff);
+  prepareJsonBatOutput(g_szRecvBuff, sizeof(g_szRecvBuff));
+  server.send(200, "application/json", g_szRecvBuff);
+}
+
 void handleRoot() {
   #ifdef AUTHENTICATION
   if (!server.authenticate(www_username, www_password)) {
     return server.requestAuthentication();
   }
   #endif
-  timeClient.update(); //get ntp datetime
+  //timeClient.update(); //get ntp datetime
   unsigned long days = 0, hours = 0, minutes = 0;
   unsigned long val = os_getCurrentTimeSec();
   days = val / (3600*24);
@@ -343,18 +374,22 @@ void handleRoot() {
   minutes = val / 60;
   val -= minutes*60;
 
-  time_t epochTime = timeClient.getEpochTime();
-  String formattedTime = timeClient.getFormattedTime();
+  //time_t epochTime = timeClient.getEpochTime();
+  //String formattedTime = timeClient.getFormattedTime();
   //Get a time structure
-  struct tm *ptm = gmtime ((time_t *)&epochTime); 
-  int currentMonth = ptm->tm_mon+1;
+  //struct tm *ptm = gmtime ((time_t *)&epochTime); 
+  //int currentMonth = ptm->tm_mon+1;
 
   static char szTmp[9500] = "";  
-  long timezone= GMT / 3600;
-  snprintf(szTmp, sizeof(szTmp)-1, "<html><b>Pylontech Battery</b><br>Time GMT: %s (%s %d)<br>Uptime: %02d:%02d:%02d.%02d<br><br>free heap: %u<br>Wifi RSSI: %d<BR>Wifi SSID: %s", 
-            formattedTime, "GMT ", timezone,
-            (int)days, (int)hours, (int)minutes, (int)val, 
-            ESP.getFreeHeap(), WiFi.RSSI(), WiFi.SSID().c_str());
+  //long timezone= GMT / 3600;
+  //snprintf(szTmp, sizeof(szTmp)-1, "<html><b>Pylontech Battery</b><br>Time GMT: %s (%s %d)<br>Uptime: %02d:%02d:%02d.%02d<br><br>free heap: %u<br>Wifi RSSI: %d<BR>Wifi SSID: %s", 
+  //          formattedTime, "GMT ", timezone,
+  //          (int)days, (int)hours, (int)minutes, (int)val, 
+  //          ESP.getFreeHeap(), WiFi.RSSI(), WiFi.SSID().c_str());
+  snprintf(szTmp, sizeof(szTmp)-1, "<html><b>Pylontech Battery</b><br>Time GMT: %d/%02d/%02d %02d:%02d:%02d (%s)<br>Uptime: %02d:%02d:%02d.%02d<br><br>free heap: %u<br>Wifi RSSI: %d<BR>Wifi SSID: %s", 
+          year(), month(), day(), hour(), minute(), second(), "GMT",
+          (int)days, (int)hours, (int)minutes, (int)val, 
+          ESP.getFreeHeap(), WiFi.RSSI(), WiFi.SSID().c_str());
 
   strncat(szTmp, "<BR><a href='/log'>Runtime log</a><HR>", sizeof(szTmp)-1);
   strncat(szTmp, "<form action='/req' method='get'>Command:<input type='text' name='code'/><input type='submit'> <a href='/req?code=pwr'>PWR</a> | <a href='/req?code=pwr%201'>Power 1</a> |  <a href='/req?code=pwr%202'>Power 2</a> | <a href='/req?code=pwr%203'>Power 3</a> | <a href='/req?code=pwr%204'>Power 4</a> | <a href='/req?code=help'>Help</a> | <a href='/req?code=log'>Event Log</a> | <a href='/req?code=time'>Time</a><br>", sizeof(szTmp)-1);
@@ -384,6 +419,21 @@ unsigned long os_getCurrentTimeSec()
   
   //millis will wrap each 50 days, as we are interested only in seconds, let's keep the wrap counter
   return (wrapCnt*4294967) + seconds;
+}
+
+void syncTime()
+{
+  //get time from NTP
+  time_t currentTimeGMT = getNtpTime();
+  if(currentTimeGMT)
+  {
+    ntpTimeReceived = true;
+    setTime(currentTimeGMT);
+  }  
+  else
+  {
+    timer.setTimeout(5000, syncTime); //try again in 5 seconds
+  }
 }
 
 void wakeUpConsole()
@@ -416,6 +466,7 @@ void wakeUpConsole()
 }
 
 #define MAX_PYLON_BATTERIES 8
+#define MAX_PYLON_CELLS 1
 
 struct pylonBattery
 {
@@ -424,10 +475,12 @@ struct pylonBattery
   long  voltage; //in mW
   long  current; //in mA, negative value is discharge
   long  tempr;   //temp of case or BMS?
+  long  coulomb; //in mAH
   long  cellTempLow;
   long  cellTempHigh;
   long  cellVoltLow;
   long  cellVoltHigh;
+  char bal[4]; //N | Y
   char baseState[9];    //Charge | Dischg | Idle
   char voltageState[9]; //Normal
   char currentState[9]; //Normal
@@ -463,6 +516,7 @@ struct pylonBattery
 struct batteryStack
 {
   int batteryCount;
+  int cellCount;
   int soc;  //in %, if charging: average SOC, otherwise: lowest SOC
   int temp; //in mC, if highest temp is > 15C, this will show the highest temp, otherwise the lowest
   long currentDC;    //mAh current going in or out of the battery
@@ -471,6 +525,7 @@ struct batteryStack
 
   
   pylonBattery batts[MAX_PYLON_BATTERIES];
+  pylonBattery cells[MAX_PYLON_CELLS];
 
   bool isNormal() const
   {
@@ -726,6 +781,128 @@ bool parsePwrResponse(const char* pStr)
   return true;
 }
 
+bool parseBatResponse(const char* pStr)
+{
+  
+  // note: this only works on the battery where you plugged in the ESP
+
+  if(strstr(pStr, "Command completed successfully") == NULL)
+  {
+    return false;
+  }
+  
+  int chargeCnt2    = 0;
+  int dischargeCnt2 = 0;
+  int idleCnt2      = 0;
+  int alarmCnt2     = 0;
+  int socAvg2       = 0;
+  int socLow2       = 0;
+  int tempHigh2     = 0;
+  int tempLow2      = 0;
+
+  memset(&g_stack, 0, sizeof(g_stack));
+
+  for(int ix=0; ix<MAX_PYLON_CELLS; ix++)
+  {
+    char szToFind[32] = "";
+    snprintf(szToFind, sizeof(szToFind)-1, "\r\r\n%d     ", ix);
+
+    const char* pLineStart = strstr(pStr, szToFind);
+    if(pLineStart == NULL)
+    {
+      return false;
+    }
+
+    pLineStart += 3; //move past \r\r\n
+
+    extractStr(pLineStart, 36, g_stack.cells[ix].baseState, sizeof(g_stack.cells[ix].baseState));
+    if(strcmp(g_stack.cells[ix].baseState, "Absent") == 0)
+    {
+      g_stack.cells[ix].isPresent = false;
+    }
+    else
+    {
+      g_stack.cells[ix].isPresent = true;
+      extractStr(pLineStart, 49, g_stack.cells[ix].voltageState, sizeof(g_stack.cells[ix].voltageState));
+      extractStr(pLineStart, 62, g_stack.cells[ix].currentState, sizeof(g_stack.cells[ix].currentState));
+      extractStr(pLineStart, 73, g_stack.cells[ix].tempState, sizeof(g_stack.cells[ix].tempState));
+      extractStr(pLineStart, 116, g_stack.cells[ix].bal, sizeof(g_stack.cells[ix].bal));
+      g_stack.cells[ix].voltage = extractInt(pLineStart, 9);
+      g_stack.cells[ix].current = extractInt(pLineStart, 18);
+      g_stack.cells[ix].tempr   = extractInt(pLineStart, 27);
+      g_stack.cells[ix].soc     = extractInt(pLineStart, 86);
+      g_stack.cells[ix].coulomb = extractInt(pLineStart, 98);
+
+      //////////////////////////////// Post-process ////////////////////////
+      g_stack.cellCount++;
+      //g_stack.currentDC += g_stack.cells[ix].current;
+      //g_stack.avgVoltage += g_stack.cells[ix].voltage;
+      socAvg2 += g_stack.cells[ix].soc;
+
+      if(g_stack.cells[ix].isNormal() == false){ alarmCnt2++; }
+      else if(g_stack.cells[ix].isCharging()){chargeCnt2++;}
+      else if(g_stack.cells[ix].isDischarging()){dischargeCnt2++;}
+      else if(g_stack.cells[ix].isIdle()){idleCnt2++;}
+      else{ alarmCnt2++; } //should not really happen!
+
+      if(g_stack.cellCount == 1)
+      {
+        socLow2 = g_stack.cells[ix].soc;
+        tempLow2 = g_stack.cells[ix].cellTempLow;
+        tempHigh2 = g_stack.cells[ix].cellTempHigh;
+      }
+      else
+      {
+        if(socLow2 > g_stack.cells[ix].soc){socLow2 = g_stack.cells[ix].soc;}
+        if(tempHigh2 < g_stack.cells[ix].cellTempHigh){tempHigh2 = g_stack.cells[ix].cellTempHigh;}
+        if(tempLow2 > g_stack.cells[ix].cellTempLow){tempLow2 = g_stack.cells[ix].cellTempLow;}
+      }
+      
+    }
+  }
+
+  //now update stack state:
+  /*
+  g_stack.avgVoltage /= g_stack.cellCount;
+  g_stack.soc = socLow;
+
+  if(tempHigh > 15000) //15C
+  {
+    g_stack.temp = tempHigh; //in the summer we highlight the warmest cell
+  }
+  else
+  {
+    g_stack.temp = tempLow; //in the winter we focus on coldest cell
+  }
+
+  if(alarmCnt > 0)
+  {
+    strcpy(g_stack.baseState, "Alarm!");
+  }
+  else if(chargeCnt == g_stack.cellCount)
+  {
+    strcpy(g_stack.baseState, "Charge");
+    g_stack.soc = (int)(socAvg / g_stack.cellCount);
+  }
+  else if(dischargeCnt == g_stack.cellCount)
+  {
+    strcpy(g_stack.baseState, "Dischg");
+  }
+  else if(idleCnt == g_stack.cellCount)
+  {
+    strcpy(g_stack.baseState, "Idle");
+  }
+  else
+  {
+    strcpy(g_stack.baseState, "Balance");
+  }
+  */
+
+
+  return true;
+}
+
+
 void prepareJsonOutput(char* pBuff, int buffSize)
 {
   memset(pBuff, 0, buffSize);
@@ -738,6 +915,34 @@ void prepareJsonOutput(char* pBuff, int buffSize)
                                                                                                                                                                                                             g_stack.getPowerDC(), 
                                                                                                                                                                                                             g_stack.getEstPowerAc(),
                                                                                                                                                                                                             g_stack.isNormal() ? "true" : "false");
+}
+
+void prepareJsonBatOutput(char* pBuff, int buffSize)
+{
+  memset(pBuff, 0, buffSize);
+  char* pCurrent = pBuff;
+  int remainingSize = buffSize;
+
+  snprintf(pCurrent, remainingSize, "{");
+  remainingSize -= strlen(pCurrent);
+  pCurrent += strlen(pCurrent);
+
+  for (int i = 0; i < MAX_PYLON_CELLS; i++)
+  {
+    snprintf(pCurrent, remainingSize, "\"cell%d\": {\"soc\": %d, \"coulomb\": %ld, \"temp\": %d, \"current\": %ld, \"voltage\": %ld, \"BAL\": \"%s\"}%s",
+             i, 
+             g_stack.cells[i].soc, 
+             g_stack.cells[i].coulomb, 
+             g_stack.cells[i].tempr, 
+             g_stack.cells[i].current, 
+             g_stack.cells[i].voltage, 
+             g_stack.cells[i].bal,
+             i < MAX_PYLON_CELLS-1 ? "," : "");
+    remainingSize -= strlen(pCurrent);
+    pCurrent += strlen(pCurrent);
+  }
+
+  snprintf(pCurrent, remainingSize, "}");
 }
 
 void loop() {
@@ -842,7 +1047,45 @@ void pushBatteryDataToMqtt(const batteryStack& lastSentData, bool forceUpdate /*
     ixBattStr.toCharArray(ixBuff, 50);
     mqtt_publish_f(ixBuff, (float)g_stack.batts[ix].tempr/1000.0, (float)lastSentData.batts[ix].tempr/1000.0, 0.1, forceUpdate);
   }
-} 
+}
+
+void pushCellDataToMqtt(const batteryStack& lastSentData, bool forceUpdate /* if true - we will send all data regardless if it's the same */)
+{
+  // publishing bat details
+  for (int ix = 0; ix < g_stack.cellCount; ix++) {
+    char ixBuff[50];
+    String ixCellStr = MQTT_TOPIC_ROOT + String("cells/") + String(ix) + "/voltage";
+    ixCellStr.toCharArray(ixBuff, 50);
+    mqtt_publish_f(ixBuff, g_stack.cells[ix].voltage, lastSentData.cells[ix].voltage, 0, forceUpdate);
+    ixCellStr = MQTT_TOPIC_ROOT + String("cells/") + String(ix) + "/current";
+    ixCellStr.toCharArray(ixBuff, 50);
+    mqtt_publish_f(ixBuff, g_stack.cells[ix].current, lastSentData.cells[ix].current, 0, forceUpdate);
+    ixCellStr = MQTT_TOPIC_ROOT + String("cells/") + String(ix) + "/coulomb";
+    ixCellStr.toCharArray(ixBuff, 50);
+    mqtt_publish_f(ixBuff, g_stack.cells[ix].coulomb, lastSentData.cells[ix].coulomb, 0, forceUpdate);
+    ixCellStr = MQTT_TOPIC_ROOT + String("cells/") + String(ix) + "/soc";
+    ixCellStr.toCharArray(ixBuff, 50);
+    mqtt_publish_i(ixBuff, g_stack.cells[ix].soc, lastSentData.cells[ix].soc, 0, forceUpdate);
+    ixCellStr = MQTT_TOPIC_ROOT + String("cells/") + String(ix) + "/charging";
+    ixCellStr.toCharArray(ixBuff, 50);
+    mqtt_publish_i(ixBuff, g_stack.cells[ix].isCharging()?1:0, lastSentData.cells[ix].isCharging()?1:0, 0, forceUpdate);
+    ixCellStr = MQTT_TOPIC_ROOT + String("cells/") + String(ix) + "/discharging";
+    ixCellStr.toCharArray(ixBuff, 50);
+    mqtt_publish_i(ixBuff, g_stack.cells[ix].isDischarging()?1:0, lastSentData.cells[ix].isDischarging()?1:0, 0, forceUpdate);
+    ixCellStr = MQTT_TOPIC_ROOT + String("cells/") + String(ix) + "/idle";
+    ixCellStr.toCharArray(ixBuff, 50);
+    mqtt_publish_i(ixBuff, g_stack.cells[ix].isIdle()?1:0, lastSentData.cells[ix].isIdle()?1:0, 0, forceUpdate);
+    ixCellStr = MQTT_TOPIC_ROOT + String("cells/") + String(ix) + "/state";
+    ixCellStr.toCharArray(ixBuff, 50);
+    mqtt_publish_s(ixBuff, g_stack.cells[ix].isIdle()?"Idle":g_stack.cells[ix].isCharging()?"Charging":g_stack.cells[ix].isDischarging()?"Discharging":"", lastSentData.cells[ix].isIdle()?"Idle":lastSentData.cells[ix].isCharging()?"Charging":lastSentData.cells[ix].isDischarging()?"Discharging":"", forceUpdate);
+    ixCellStr = MQTT_TOPIC_ROOT + String("cells/") + String(ix) + "/balancing";
+    ixCellStr.toCharArray(ixBuff, 50);
+    mqtt_publish_s(ixBuff, g_stack.cells[ix].bal, lastSentData.cells[ix].bal, forceUpdate);
+    ixCellStr = MQTT_TOPIC_ROOT + String("cells/") + String(ix) + "/temp";
+    ixCellStr.toCharArray(ixBuff, 50);
+    mqtt_publish_f(ixBuff, (float)g_stack.cells[ix].tempr/1000.0, (float)lastSentData.cells[ix].tempr/1000.0, 0.1, forceUpdate);
+  }
+}
 
 void mqttLoop()
 {
@@ -882,6 +1125,25 @@ void mqttLoop()
     callCnt++;
     g_lastDataSent = os_getCurrentTimeSec();
     memcpy(&lastSentData, &g_stack, sizeof(batteryStack));
+  }
+
+  //next: read data from cells and send via MQTT (but only once per MQTT_PUSH_FREQ_SEC seconds)
+  static unsigned long g_lastDataSent2 = 0;
+  if(mqttClient.connected() && 
+     os_getCurrentTimeSec() - g_lastDataSent2 > MQTT_PUSH_FREQ_SEC &&
+     sendCommandAndReadSerialResponse("bat") == true)
+  {
+    static batteryStack lastSentData2; //this is the last state we sent to MQTT, used to prevent sending the same data over and over again
+    static unsigned int callCnt2 = 0;
+    
+    parseBatResponse(g_szRecvBuff);
+
+    bool forceUpdate = (callCnt2 % 20 == 0); //push all the data every 20th call
+    pushCellDataToMqtt(lastSentData2, forceUpdate);
+    
+    callCnt2++;
+    g_lastDataSent2 = os_getCurrentTimeSec();
+    memcpy(&lastSentData2, &g_stack, sizeof(batteryStack));
   }
   
   mqttClient.loop();
